@@ -1,43 +1,71 @@
 import os
+import sys
+import boto3
 import pandas as pd
+import mysql.connector
+from mysql.connector import Error
 
-def read_from_mysql():
-    import mysql.connector
-    conn = mysql.connector.connect(
-        host=os.getenv("MYSQL_HOST"),
-        port=int(os.getenv("MYSQL_PORT", 3306)),
-        user=os.getenv("MYSQL_USER"),
-        password=os.getenv("MYSQL_PASSWORD"),
-        database=os.getenv("MYSQL_DB"),
-    )
-    table = os.getenv("MYSQL_TABLE")
-    query = f"SELECT * FROM {table}"
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
+def getenv(name, default=None):
+    v = os.getenv(name, default)
+    if v is None:
+        return default
+    return v
 
 def main():
-    output_file = os.getenv("OUTPUT_FILE", "output.csv")
-    bucket = os.getenv("S3_BUCKET")
+    host = getenv("MYSQL_HOST", "localhost")
+    port = int(getenv("MYSQL_PORT", "3306"))
+    user = getenv("MYSQL_USER", "root")
+    password = getenv("MYSQL_PASS", "")
+    database = getenv("MYSQL_DB", "")
+    table = getenv("MYSQL_TABLE", "")
+    output_file = getenv("OUTPUT_FILE", "data.csv")
+    bucket = getenv("S3_BUCKET", "")
+    s3_key = getenv("S3_KEY", output_file)
 
-    if os.getenv("MYSQL_USE_FILE") == "1":
-        print("[INFO] Usando data.csv como fuente (modo prueba)")
-        df = pd.read_csv("data.csv")
-    else:
-        print("[INFO] Conectando a MySQL...")
-        df = read_from_mysql()
+    if not database or not table or not bucket:
+        print("ERROR: faltan variables requeridas. Asegúrate de definir MYSQL_DB, MYSQL_TABLE y S3_BUCKET.", file=sys.stderr)
+        return 10
 
-    df.to_csv(output_file, index=False)
-    print(f"[INFO] Datos guardados en {output_file}")
+    print("Conectando a MySQL:", host, "DB:", database, "TABLA:", table)
+    conn = None
+    cursor = None
+    try:
+        conn = mysql.connector.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            connection_timeout=10
+        )
+        cursor = conn.cursor()
+        query = f"SELECT * FROM `{table}`;"
+        cursor.execute(query)
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        rows = cursor.fetchall()
+        df = pd.DataFrame(rows, columns=cols)
+        df.to_csv(output_file, index=False)
+        print(f"Guardado CSV local: {output_file} (filas: {len(df)})")
+    except Error as e:
+        print("ERROR: fallo al conectar/consultar MySQL ->", e, file=sys.stderr)
+        return 20
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None and conn.is_connected():
+            conn.close()
 
-    if bucket:
-        import boto3
+    print("Subiendo a S3 bucket:", bucket, "key:", s3_key)
+    try:
         s3 = boto3.client("s3")
-        key = os.path.basename(output_file)
-        s3.upload_file(output_file, bucket, key)
-        print(f"[INFO] Archivo subido a s3://{bucket}/{key}")
-    else:
-        print("[WARN] No se definió S3_BUCKET, se omitió la subida a S3.")
+        s3.upload_file(output_file, bucket, s3_key)
+        print(f"Archivo subido a s3://{bucket}/{s3_key}")
+    except Exception as e:
+        print("ERROR: fallo al subir a S3 ->", e, file=sys.stderr)
+        return 30
+
+    print("Ingesta completada correctamente.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
